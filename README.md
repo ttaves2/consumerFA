@@ -63,7 +63,8 @@ Create `local.settings.json` (git-ignored — copy this and fill in your own val
     "AzureWebJobsStorage": "UseDevelopmentStorage=true",
     "FUNCTIONS_WORKER_RUNTIME": "dotnet-isolated",
     "ServiceBusConnection": "Endpoint=sb://<namespace>.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=<key>",
-    "SqlConnectionString": "Server=localhost;Database=consumerfa;Trusted_Connection=True;TrustServerCertificate=True"
+    "SqlConnectionString": "Server=localhost;Database=consumerfa;Trusted_Connection=True;TrustServerCertificate=True",
+    "APPLICATIONINSIGHTS_CONNECTION_STRING": "InstrumentationKey=...;IngestionEndpoint=https://....applicationinsights.azure.com/"
   }
 }
 ```
@@ -125,6 +126,44 @@ two failure modes (malformed message, malformed mapping config) — plus `Destin
 validation and the retry/dead-letter split. The SQL lookup and the outbound POST are not
 covered; they need a database and a listener.
 
+## Tracing a message
+
+Every message produces exactly one log line, whatever happens to it, with these properties:
+
+| Property | Values |
+| --- | --- |
+| `Outcome` | `Succeeded`, `Retrying`, `DeadLettered`, `ConfigUnavailable` |
+| `MessageId` | the Service Bus message id, also sent as the `Idempotency-Key` header |
+| `Body` | the inbound payload, truncated at 4000 chars |
+| `Detail` | destination URL and status code, or the failure reason |
+| `ElapsedMs`, `DeliveryCount`, `EventName` | timing and redelivery context |
+
+`Body` is logged in full precisely so support does not need to know the field name: paste
+whatever id the caller quotes into the search and the message turns up.
+
+```kql
+traces
+| where customDimensions.Body contains "ORD-10044"
+| project timestamp, Outcome = customDimensions.Outcome, Detail = customDimensions.Detail,
+          MessageId = customDimensions.MessageId, DeliveryCount = customDimensions.DeliveryCount
+| order by timestamp desc
+```
+
+What each outcome means:
+
+- **Succeeded** - the destination returned 2xx and the message was completed.
+- **Retrying** - 5xx, 408 or 429. The message is redelivered; expect more lines with a higher `DeliveryCount`, then either `Succeeded` or a dead-letter once deliveries run out.
+- **DeadLettered** - either the destination rejected the payload (any other non-2xx) or the mapping failed. It will not be retried; the message is in `myFirstQueue/$deadletterqueue` with the reason attached.
+- **ConfigUnavailable** - the config row could not be loaded (SQL down, row missing, bad `DestinationUrl`). The message was left unsettled and comes back when the lock lapses, so this one is usually an infrastructure problem rather than a message problem.
+
+To count yesterday's outcomes:
+
+```kql
+traces
+| where timestamp > ago(1d) and isnotempty(customDimensions.Outcome)
+| summarize count() by tostring(customDimensions.Outcome)
+```
+
 ## Layout
 
 | Path | What's in it |
@@ -136,6 +175,7 @@ covered; they need a database and a listener.
 | `CoreUnitTest/MappingTests.cs` | tests for the mapping step |
 | `CoreUnitTest/DestinationUrlTests.cs` | tests for DestinationUrl validation |
 | `CoreUnitTest/RetryClassificationTests.cs` | tests for which statuses retry vs dead-letter |
+| `CoreUnitTest/TruncateTests.cs` | tests for log/dead-letter truncation |
 | `consumerFA.slnx` | both projects |
 
 ## Notes
@@ -143,5 +183,7 @@ covered; they need a database and a listener.
 - JSONata is [Jsonata.Net.Native](https://github.com/mikhail-barg/jsonata.net.native). Its `Eval` returns pretty-printed JSON; harmless over HTTP.
 - No retry policy on the outbound POST — Service Bus redelivery covers it. Reach for Polly if the destination flaps.
 - Cache is TTL-only, no invalidation. Restart the host if you need a config change immediately. A semaphore keeps a cold start from opening one SQL connection per concurrent message.
-- Worker logs reach Application Insights by being relayed through the Functions host, which is the default and needs no package. Set `APPLICATIONINSIGHTS_CONNECTION_STRING` on the function app. For direct worker telemetry (dependency tracking on the SQL and HTTP calls) add the OpenTelemetry packages and exporter.
+- Application Insights goes through OpenTelemetry: `UseFunctionsWorkerDefaults()` plus `UseAzureMonitorExporter()` in `Program.cs`, and `telemetryMode: OpenTelemetry` in `host.json`. It needs `APPLICATIONINSIGHTS_CONNECTION_STRING` set on the function app; without it the exporter is a no-op and logs still reach Application Insights through the host relay.
+- `AddHttpClientInstrumentation()` records the outbound POST as a dependency, so a slow or failing destination is visible in the trace. SQL is not instrumented - it is one cached query per 5 minutes. Add `OpenTelemetry.Instrumentation.SqlClient` if that changes.
+- Bodies are logged. Anything sensitive in a message lands in Application Insights and is kept for the workspace retention period.
 - `DestinationUrl` must be an absolute `http`/`https` URL; anything else fails the config load with an error naming the row. The scheme is all that's checked, so keep write access to `InboundMappingConfig` restricted — a valid URL can still point somewhere internal.

@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net;
 using System.Text;
 using Azure.Messaging.ServiceBus;
@@ -16,6 +17,12 @@ public class MyFirstQueueFunction(
 {
     private const string QueueName = "myFirstQueue";
 
+    // Service Bus caps the dead-letter description at 4096 chars and rejects the settlement above it.
+    private const int MaxReasonChars = 1000;
+
+    // Enough to hold the body App Insights is searched by; its custom dimensions cap out at 8192.
+    private const int MaxBodyChars = 4000;
+
     // ponytail: TTL, not invalidation. Config edits go live within 5 min; shorten if that's too slow.
     private static readonly TimeSpan ConfigTtl = TimeSpan.FromMinutes(5);
 
@@ -23,34 +30,48 @@ public class MyFirstQueueFunction(
     private static readonly SemaphoreSlim ConfigLock = new(1, 1);
 
     // host.json sets autoCompleteMessages: false, so every path below must settle the message.
+    // Every path also emits exactly one Log(...) line carrying Outcome and Body, which is what
+    // support searches on. See the "Tracing a message" section of the README.
     [Function(nameof(MyFirstQueueFunction))]
     public async Task Run(
         [ServiceBusTrigger(QueueName, Connection = "ServiceBusConnection")] ServiceBusReceivedMessage message,
         ServiceBusMessageActions messageActions,
         CancellationToken cancellationToken)
     {
-        // Config failures are transient (SQL down, row not deployed yet): throw, leaving the message
-        // unsettled so it is redelivered once the lock lapses.
-        var (query, destinationUrl) = await GetConfigAsync(cancellationToken);
+        var started = Stopwatch.GetTimestamp();
+        var body = Truncate(message.Body.ToString(), MaxBodyChars);
+
+        (JsonataQuery Query, Uri DestinationUrl) config;
+        try
+        {
+            config = await GetConfigAsync(cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            // Transient (SQL down, row not deployed yet). Leave the message unsettled so it comes
+            // back when the lock lapses, rather than dead-lettering a working payload.
+            Log(LogLevel.Error, ex, message, "ConfigUnavailable", started, body, ex.Message);
+            throw;
+        }
 
         string mapped;
         try
         {
-            mapped = Map(query, message.Body.ToString());
+            mapped = Map(config.Query, message.Body.ToString());
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             // The body or the mapping is wrong; replaying it will fail identically.
-            logger.LogError(ex, "Mapping failed for {MessageId}", message.MessageId);
+            Log(LogLevel.Error, ex, message, "DeadLettered", started, body, "Mapping failed: " + ex.Message);
             await messageActions.DeadLetterMessageAsync(
                 message,
                 deadLetterReason: "MappingFailed",
-                deadLetterErrorDescription: Truncate(ex.Message),
+                deadLetterErrorDescription: Truncate(ex.Message, MaxReasonChars),
                 cancellationToken: cancellationToken);
             return;
         }
 
-        using var request = new HttpRequestMessage(HttpMethod.Post, destinationUrl)
+        using var request = new HttpRequestMessage(HttpMethod.Post, config.DestinationUrl)
         {
             Content = new StringContent(mapped, Encoding.UTF8, "application/json")
         };
@@ -58,29 +79,48 @@ public class MyFirstQueueFunction(
         request.Headers.TryAddWithoutValidation("Idempotency-Key", message.MessageId);
 
         using var response = await httpClientFactory.CreateClient().SendAsync(request, cancellationToken);
-
-        logger.LogInformation(
-            "Posted {MessageId} to {Url}: {Status}", message.MessageId, destinationUrl, (int)response.StatusCode);
+        var status = (int)response.StatusCode;
 
         if (response.IsSuccessStatusCode)
         {
             await messageActions.CompleteMessageAsync(message, cancellationToken);
+            Log(LogLevel.Information, null, message, "Succeeded", started, body,
+                $"POST {config.DestinationUrl} returned {status}");
             return;
         }
 
-        if (IsRetryable(response.StatusCode))
-            throw new HttpRequestException($"Destination returned {(int)response.StatusCode}, will retry.");
+        var responseBody = Truncate(await response.Content.ReadAsStringAsync(cancellationToken), MaxReasonChars);
 
-        var body = Truncate(await response.Content.ReadAsStringAsync(cancellationToken));
-        logger.LogError(
-            "Dead-lettering {MessageId}: destination returned {Status}. {Body}",
-            message.MessageId, (int)response.StatusCode, body);
+        if (IsRetryable(response.StatusCode))
+        {
+            Log(LogLevel.Warning, null, message, "Retrying", started, body,
+                $"POST {config.DestinationUrl} returned {status}: {responseBody}");
+            throw new HttpRequestException($"Destination returned {status}, will retry.");
+        }
+
+        Log(LogLevel.Error, null, message, "DeadLettered", started, body,
+            $"POST {config.DestinationUrl} returned {status}: {responseBody}");
         await messageActions.DeadLetterMessageAsync(
             message,
-            deadLetterReason: $"Destination returned {(int)response.StatusCode}",
-            deadLetterErrorDescription: body,
+            deadLetterReason: $"Destination returned {status}",
+            deadLetterErrorDescription: responseBody,
             cancellationToken: cancellationToken);
     }
+
+    /// <summary>
+    /// The one log line per message that support traces on. Outcome is one of Succeeded,
+    /// Retrying, DeadLettered or ConfigUnavailable; Body carries the inbound payload so any id
+    /// inside it is searchable without knowing the field name.
+    /// </summary>
+    private void Log(
+        LogLevel level, Exception? ex, ServiceBusReceivedMessage message,
+        string outcome, long started, string body, string detail) =>
+        logger.Log(
+            level, ex,
+            "Message {MessageId} {Outcome} after {ElapsedMs}ms on delivery {DeliveryCount}. "
+            + "{Detail} EventName={EventName} Body={Body}",
+            message.MessageId, outcome, (long)Stopwatch.GetElapsedTime(started).TotalMilliseconds,
+            message.DeliveryCount, detail, QueueName, body);
 
     /// <summary>
     /// True when replaying the same request could plausibly succeed. 408 and 429 are 4xx but
@@ -103,8 +143,8 @@ public class MyFirstQueueFunction(
             : throw new InvalidOperationException(
                 $"InboundMappingConfig.DestinationUrl for EventName '{eventName}' is not an absolute http(s) URL: '{url}'.");
 
-    // Service Bus caps dead-letter reason/description at 4096 chars and rejects the settlement above it.
-    private static string Truncate(string value) => value.Length <= 1000 ? value : value[..1000];
+    public static string Truncate(string value, int max) =>
+        value.Length <= max ? value : string.Concat(value.AsSpan(0, max), "...[truncated]");
 
     private async Task<(JsonataQuery Query, Uri DestinationUrl)> GetConfigAsync(CancellationToken cancellationToken)
     {
