@@ -5,6 +5,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Xml;
 using Azure.Messaging.ServiceBus;
+using Azure.Storage.Blobs;
 using Newtonsoft.Json;
 using Jsonata.Net.Native;
 using Microsoft.Azure.Functions.Worker;
@@ -31,6 +32,9 @@ public class MyFirstQueueFunction(
     private const int MaxTraceFields = 10;
     private const int MaxTraceValueChars = 200;
 
+    /// <summary>Blob container holding bodies too large to log inline.</summary>
+    private const string ArchiveContainer = "message-bodies";
+
     // ponytail: TTL, not invalidation. Config edits go live within 5 min; shorten if that's too slow.
     private static readonly TimeSpan ConfigTtl = TimeSpan.FromMinutes(5);
 
@@ -48,7 +52,7 @@ public class MyFirstQueueFunction(
     {
         var started = Stopwatch.GetTimestamp();
         var raw = message.Body.ToString();
-        var body = Truncate(raw, MaxBodyChars);
+        var body = await BodyForLogAsync(Archive.Value, raw, message.MessageId, logger, cancellationToken);
 
         // Convert before anything else, so the id fields below are available to every outcome
         // and not just the ones that get as far as mapping.
@@ -200,6 +204,57 @@ public class MyFirstQueueFunction(
             ? uri
             : throw new InvalidOperationException(
                 $"InboundMappingConfig.DestinationUrl for EventName '{eventName}' is not an absolute http(s) URL: '{url}'.");
+
+    /// <summary>
+    /// The container large bodies are archived to, built from the Function App's own storage
+    /// account so there is no second connection string to configure. Null when that setting is
+    /// absent, which disables archiving rather than failing the message.
+    /// </summary>
+    // ponytail: reads the connection-string form of AzureWebJobsStorage. A deployment using an
+    // identity-based connection sets AzureWebJobsStorage__accountName instead, and archiving
+    // silently turns off; pass a DefaultAzureCredential here if you move to one.
+    private static readonly Lazy<BlobContainerClient?> Archive = new(() =>
+        Environment.GetEnvironmentVariable("AzureWebJobsStorage") is { Length: > 0 } connection
+            ? new BlobContainerClient(connection, ArchiveContainer)
+            : null);
+
+    /// <summary>
+    /// Returns the body as it should be logged. A body short enough to log whole is returned
+    /// untouched; one that would be truncated is written to blob storage first and the link
+    /// appended, so support can read the full payload without Service Bus or SQL access.
+    /// Archiving never fails the message - on any storage error the truncated body is logged alone.
+    /// </summary>
+    public static async Task<string> BodyForLogAsync(
+        BlobContainerClient? archive, string raw, string messageId, ILogger logger,
+        CancellationToken cancellationToken)
+    {
+        if (raw.Length <= MaxBodyChars) return raw;
+
+        var truncated = Truncate(raw, MaxBodyChars);
+        if (archive is null) return truncated;
+
+        try
+        {
+            // Date-partitioned so a lifecycle rule can expire old payloads by prefix, and keyed by
+            // MessageId so a redelivery overwrites its own blob instead of adding another copy.
+            var name = $"{DateTime.UtcNow:yyyy/MM/dd}/"
+                + (string.IsNullOrWhiteSpace(messageId) ? Guid.NewGuid().ToString() : messageId);
+
+            // Archiving is rare, so paying for this check here beats a round trip at startup.
+            await archive.CreateIfNotExistsAsync(cancellationToken: cancellationToken);
+
+            var blob = archive.GetBlobClient(name);
+            await blob.UploadAsync(BinaryData.FromString(raw), overwrite: true, cancellationToken);
+
+            return $"{truncated} [full body: {blob.Uri}]";
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Diagnostics must never cost a message. Log why and fall back to the truncated body.
+            logger.LogWarning(ex, "Could not archive the body of {MessageId}: {Reason}", messageId, ex.Message);
+            return truncated;
+        }
+    }
 
     public static string Truncate(string value, int max) =>
         value.Length <= max ? value : string.Concat(value.AsSpan(0, max), "...[truncated]");

@@ -166,7 +166,7 @@ Every message produces exactly one log line, whatever happens to it, with these 
 | --- | --- |
 | `Outcome` | `Succeeded`, `Retrying`, `DeadLettered`, `ConfigUnavailable` |
 | `MessageId` | the Service Bus message id, also sent as the `Idempotency-Key` header |
-| `Body` | the inbound payload, truncated at 4000 chars |
+| `Body` | the inbound payload, truncated at 4000 chars, with a link to the full copy when it was |
 | `Detail` | destination URL and status code, or the failure reason |
 | `ElapsedMs`, `DeliveryCount`, `EventName` | timing and redelivery context |
 
@@ -213,6 +213,29 @@ These dimensions travel as a log scope, so `Program.cs` must set `IncludeScopes 
 Without it they are dropped silently, which is why `CustomDimensionTests` asserts both halves
 of that: that dynamic keys reach the record, and that they vanish when the flag is off.
 
+### Large bodies
+
+A body over 4000 chars is written whole to blob storage before it is logged, and the log line
+carries the link after the truncated text:
+
+```
+Body=<first 4000 chars>...[truncated] [full body: https://<account>.blob.core.windows.net/message-bodies/2026/11/16/<MessageId>]
+```
+
+That is the only way to read a payload that failed, since the dead-letter queue is not
+reachable without Service Bus access. Bodies at or under the limit are logged inline and never
+touch storage.
+
+The container is `message-bodies` on the Function App's own storage account
+(`AzureWebJobsStorage`), so there is no second connection string to configure - but a
+deployment using an identity-based connection sets `AzureWebJobsStorage__accountName` instead
+and archiving silently turns off. Blobs are laid out as `yyyy/MM/dd/<MessageId>`, so a
+lifecycle rule can expire them by prefix; nothing expires them today. A redelivery overwrites
+its own blob rather than adding a copy.
+
+Archiving never costs a message: if storage is unreachable the line is logged with the
+truncated body alone and a warning beside it, which `BodyArchiveTests` covers.
+
 What each outcome means:
 
 - **Succeeded** - the destination returned 2xx and the message was completed.
@@ -243,6 +266,7 @@ traces
 | `CoreUnitTest/XmlConversionTests.cs` | tests for XML detection, conversion shapes and XXE |
 | `CoreUnitTest/TraceFieldTests.cs` | tests for which body fields become custom dimensions |
 | `CoreUnitTest/CustomDimensionTests.cs` | tests that scope keys survive the OpenTelemetry export |
+| `CoreUnitTest/BodyArchiveTests.cs` | tests for archiving large bodies to blob storage |
 | `consumerFA.slnx` | both projects |
 
 ## Notes
