@@ -5,7 +5,7 @@ using Microsoft.Azure.Functions.Worker;
 namespace Core.Functions;
 
 /// <summary>Service Bus binding for myFirstQueue. The pipeline itself lives in MappingService.</summary>
-public class MyFirstQueueFunction(MappingService service)
+public class MyFirstQueueFunction(IMappingService service)
 {
     private const string QueueName = "myFirstQueue";
 

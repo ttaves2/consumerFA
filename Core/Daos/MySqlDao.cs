@@ -6,7 +6,7 @@ namespace Core.Daos;
 public sealed record InboundMappingConfig(string MappingConfig, string DestinationUrl);
 
 /// <summary>SQL Server access. Reads SqlConnectionString from the environment.</summary>
-public class MySqlDao
+public class MySqlDao : IMySqlDao
 {
     public async Task<InboundMappingConfig> GetInboundMappingConfigAsync(
         string eventName, CancellationToken cancellationToken)

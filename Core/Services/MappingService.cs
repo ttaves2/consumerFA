@@ -25,10 +25,10 @@ public sealed record ProcessResult(string? DeadLetterReason = null, string? Dead
 /// mapping, apply it, and POST the result. Any trigger can call it with its own event name.
 /// </summary>
 public class MappingService(
-    MySqlDao dao,
-    HttpRequestor requestor,
+    IMySqlDao dao,
+    IHttpRequestor requestor,
     IMemoryCache cache,
-    ILogger<MappingService> logger)
+    ILogger<MappingService> logger) : IMappingService
 {
     // Service Bus caps the dead-letter description at 4096 chars and rejects the settlement above it.
     private const int MaxReasonChars = 1000;

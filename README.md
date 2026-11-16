@@ -267,10 +267,10 @@ traces
 | Path | What's in it |
 | --- | --- |
 | `Core/Functions/MyFirstQueueFunction.cs` | the Service Bus trigger: hands the body to the service, then completes or dead-letters |
-| `Core/Services/MappingService.cs` | the pipeline: XML conversion, config cache, JSONata, outcome logging, body archiving |
-| `Core/Daos/MySqlDao.cs` | the `InboundMappingConfig` query |
-| `Core/Requestors/HttpRequestor.cs` | the POST to `DestinationUrl`, and which statuses are retryable |
-| `Core/Program.cs` | host builder + DI |
+| `Core/Services/MappingService.cs`, `IMappingService.cs` | the pipeline: XML conversion, config cache, JSONata, outcome logging, body archiving |
+| `Core/Daos/MySqlDao.cs`, `IMySqlDao.cs` | the `InboundMappingConfig` query |
+| `Core/Requestors/HttpRequestor.cs`, `IHttpRequestor.cs` | the POST to `DestinationUrl`, and which statuses are retryable |
+| `Core/Program.cs` | host builder + DI; each interface is registered as a singleton |
 | `Core/host.json` | Functions host config |
 | `Core/Core.csproj` | the function app, and its package versions |
 | `CoreUnitTest/MappingTests.cs` | tests for the mapping step |

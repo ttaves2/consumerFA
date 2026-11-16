@@ -9,7 +9,7 @@ public sealed record HttpResult(HttpStatusCode Status, string Body)
     public bool IsSuccess => (int)Status is >= 200 and < 300;
 }
 
-public class HttpRequestor(IHttpClientFactory httpClientFactory)
+public class HttpRequestor(IHttpClientFactory httpClientFactory) : IHttpRequestor
 {
     /// <summary>
     /// POSTs a JSON payload. The idempotency key is sent as a header so the destination can

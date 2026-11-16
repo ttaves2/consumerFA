@@ -15,9 +15,9 @@ var builder = FunctionsApplication.CreateBuilder(args);
 
 builder.Services.AddHttpClient();
 builder.Services.AddMemoryCache();
-builder.Services.AddSingleton<MySqlDao>();
-builder.Services.AddSingleton<HttpRequestor>();
-builder.Services.AddSingleton<MappingService>();
+builder.Services.AddSingleton<IMySqlDao, MySqlDao>();
+builder.Services.AddSingleton<IHttpRequestor, HttpRequestor>();
+builder.Services.AddSingleton<IMappingService, MappingService>();
 
 // Needs APPLICATIONINSIGHTS_CONNECTION_STRING; without it the exporter is a no-op and logs
 // still reach Application Insights through the Functions host relay.
