@@ -1,7 +1,9 @@
 using System.Diagnostics;
 using System.Net;
 using System.Text;
+using System.Xml;
 using Azure.Messaging.ServiceBus;
+using Newtonsoft.Json;
 using Jsonata.Net.Native;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Data.SqlClient;
@@ -39,7 +41,8 @@ public class MyFirstQueueFunction(
         CancellationToken cancellationToken)
     {
         var started = Stopwatch.GetTimestamp();
-        var body = Truncate(message.Body.ToString(), MaxBodyChars);
+        var raw = message.Body.ToString();
+        var body = Truncate(raw, MaxBodyChars);
 
         (JsonataQuery Query, Uri DestinationUrl) config;
         try
@@ -57,11 +60,11 @@ public class MyFirstQueueFunction(
         string mapped;
         try
         {
-            mapped = Map(config.Query, message.Body.ToString());
+            mapped = Map(config.Query, ToJson(raw));
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            // The body or the mapping is wrong; replaying it will fail identically.
+            // The body, the XML, or the mapping is wrong; replaying it will fail identically.
             Log(LogLevel.Error, ex, message, "DeadLettered", started, body, "Mapping failed: " + ex.Message);
             await messageActions.DeadLetterMessageAsync(
                 message,
@@ -132,6 +135,32 @@ public class MyFirstQueueFunction(
 
     /// <summary>Applies a compiled JSONata mapping to a message body.</summary>
     public static string Map(JsonataQuery query, string message) => query.Eval(message);
+
+    /// <summary>
+    /// JSONata only evaluates JSON, so an XML body is converted first. The root element is kept,
+    /// so <c>&lt;order&gt;&lt;id&gt;1&lt;/id&gt;&lt;/order&gt;</c> maps as <c>order.id</c>, and every
+    /// value arrives as a string because XML carries no types - a mapping doing arithmetic on one
+    /// needs <c>$number()</c>. A body that doesn't start with '&lt;' is passed through untouched.
+    /// </summary>
+    // ponytail: sniffs the first character rather than trusting message.ContentType, which
+    // producers routinely leave unset. Read ContentType instead if yours sets it reliably.
+    public static string ToJson(string body)
+    {
+        // A BOM or leading whitespace would hide the '<' from the check below.
+        var trimmed = body.TrimStart('﻿', ' ', '\t', '\r', '\n');
+        if (!trimmed.StartsWith('<')) return body;
+
+        // Messages come from outside, so no DTDs and no external entity resolution: that closes
+        // off both XXE file reads and billion-laughs entity expansion.
+        var settings = new XmlReaderSettings { DtdProcessing = DtdProcessing.Prohibit, XmlResolver = null };
+        using var reader = XmlReader.Create(new StringReader(trimmed), settings);
+
+        var document = new XmlDocument { XmlResolver = null };
+        document.Load(reader);
+
+        return JsonConvert.SerializeXmlNode(document, Newtonsoft.Json.Formatting.None)
+            ?? throw new InvalidOperationException("XML body converted to null JSON.");
+    }
 
     /// <summary>Rejects anything that isn't an absolute http(s) URL, naming the offending row.</summary>
     // ponytail: scheme check only. Add a host allowlist if anything less trusted can write this table,

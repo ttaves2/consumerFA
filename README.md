@@ -2,9 +2,9 @@
 
 Azure Function App (.NET 10, isolated worker). One function:
 
-`myFirstQueue` (Service Bus queue) → look up the `InboundMappingConfig` row where
-`EventName = 'myFirstQueue'` → run the message through the row's JSONata
-`MappingConfig` → POST the result to the row's `DestinationUrl`.
+`myFirstQueue` (Service Bus queue) → convert the body to JSON if it is XML → run it
+through the row's JSONata `MappingConfig` from `InboundMappingConfig` where
+`EventName = 'myFirstQueue'` → POST the result to the row's `DestinationUrl`.
 
 If several rows share an `EventName`, the highest `Id` wins. Each POST carries an
 `Idempotency-Key` header holding the Service Bus `MessageId`, so a destination can
@@ -123,8 +123,40 @@ dotnet test
 
 `CoreUnitTest` covers the JSONata mapping step — rename/aggregate, missing fields, and the
 two failure modes (malformed message, malformed mapping config) — plus `DestinationUrl`
-validation and the retry/dead-letter split. The SQL lookup and the outbound POST are not
-covered; they need a database and a listener.
+validation, the retry/dead-letter split, and XML conversion including the XXE and
+entity-expansion guards. The SQL lookup and the outbound POST are not covered; they need a
+database and a listener.
+
+## XML messages
+
+JSONata only evaluates JSON, so a body whose first meaningful character is `<` is converted
+first (`Newtonsoft.Json`'s `SerializeXmlNode`). Anything else is passed through untouched.
+Detection sniffs the body rather than reading `message.ContentType`, because producers
+routinely leave that unset.
+
+Three things to know when writing a mapping against XML:
+
+| XML | Becomes | Mapping |
+| --- | --- | --- |
+| `<order><id>1</id></order>` | `{"order":{"id":"1"}}` | the root is kept, so `order.id` |
+| `<order id="1"/>` | `{"order":{"@id":"1"}}` | attributes get an `@` prefix: `order.@id` |
+| `<line>a</line><line>b</line>` | `{"line":["a","b"]}` | repeated elements become an array |
+| `<line>a</line>` (alone) | `{"line":"a"}` | a single one stays scalar |
+| `<?xml version="1.0"?>` | `{"?xml":{"@version":"1.0"},...}` | sits beside the root, so harmless |
+
+**Every value arrives as a string**, because XML carries no types. A mapping doing arithmetic
+needs `$number()`:
+
+```jsonata
+{"id": order.id, "total": $sum(order.lines.line.amount.$number($))}
+```
+
+The single-vs-repeated split in the table is the one to watch, though JSONata's sequence
+semantics absorb most of it — `order.lines.line.amount` behaves the same for one line or ten.
+
+DTDs are prohibited and external entities are not resolved, so a message cannot use an XML
+doctype to read files off the host or to mount an entity-expansion attack. Both cases are
+covered in `XmlConversionTests`.
 
 ## Tracing a message
 
@@ -176,11 +208,13 @@ traces
 | `CoreUnitTest/DestinationUrlTests.cs` | tests for DestinationUrl validation |
 | `CoreUnitTest/RetryClassificationTests.cs` | tests for which statuses retry vs dead-letter |
 | `CoreUnitTest/TruncateTests.cs` | tests for log/dead-letter truncation |
+| `CoreUnitTest/XmlConversionTests.cs` | tests for XML detection, conversion shapes and XXE |
 | `consumerFA.slnx` | both projects |
 
 ## Notes
 
 - JSONata is [Jsonata.Net.Native](https://github.com/mikhail-barg/jsonata.net.native). Its `Eval` returns pretty-printed JSON; harmless over HTTP.
+- `Newtonsoft.Json` is referenced only for `SerializeXmlNode`. The BCL has no XML-to-JSON converter, and hand-rolling one gets repeated-elements-to-arrays wrong in ways that corrupt mappings silently.
 - No retry policy on the outbound POST — Service Bus redelivery covers it. Reach for Polly if the destination flaps.
 - Cache is TTL-only, no invalidation. Restart the host if you need a config change immediately. A semaphore keeps a cold start from opening one SQL connection per concurrent message.
 - Application Insights goes through OpenTelemetry: `UseFunctionsWorkerDefaults()` plus `UseAzureMonitorExporter()` in `Program.cs`, and `telemetryMode: OpenTelemetry` in `host.json`. It needs `APPLICATIONINSIGHTS_CONNECTION_STRING` set on the function app; without it the exporter is a no-op and logs still reach Application Insights through the host relay.
