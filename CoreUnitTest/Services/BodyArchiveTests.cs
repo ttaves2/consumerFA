@@ -2,7 +2,7 @@ using Azure.Storage.Blobs;
 using Core.Services;
 using Microsoft.Extensions.Logging.Abstractions;
 
-namespace CoreUnitTest;
+namespace CoreUnitTest.Services;
 
 public class BodyArchiveTests
 {

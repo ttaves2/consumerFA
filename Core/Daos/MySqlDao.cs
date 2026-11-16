@@ -5,15 +5,19 @@ namespace Core.Daos;
 /// <summary>A row of InboundMappingConfig, as stored. Validating it is the caller's job.</summary>
 public sealed record InboundMappingConfig(string MappingConfig, string DestinationUrl);
 
-/// <summary>SQL Server access. Reads SqlConnectionString from the environment.</summary>
-public class MySqlDao : IMySqlDao
+/// <summary>
+/// SQL Server access. A missing connection string fails each lookup rather than startup, so it
+/// surfaces as ConfigUnavailable on the message that hit it.
+/// </summary>
+public class MySqlDao(string? connectionString) : IMySqlDao
 {
     public async Task<InboundMappingConfig> GetInboundMappingConfigAsync(
         string eventName, CancellationToken cancellationToken)
     {
         await using var connection = new SqlConnection(
-            Environment.GetEnvironmentVariable("SqlConnectionString")
-            ?? throw new InvalidOperationException("SqlConnectionString is not configured."));
+            connectionString is { Length: > 0 }
+                ? connectionString
+                : throw new InvalidOperationException("SqlConnectionString is not configured."));
         await connection.OpenAsync(cancellationToken);
 
         // TOP 1 + ORDER BY: EventName has no unique constraint, so without this the row is arbitrary.

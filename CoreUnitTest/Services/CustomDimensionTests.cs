@@ -3,7 +3,7 @@ using Microsoft.Extensions.Logging;
 using OpenTelemetry;
 using OpenTelemetry.Logs;
 
-namespace CoreUnitTest;
+namespace CoreUnitTest.Services;
 
 /// <summary>
 /// Guards the mechanism the id extraction relies on: that scope entries with runtime-determined

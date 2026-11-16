@@ -15,7 +15,7 @@ var builder = FunctionsApplication.CreateBuilder(args);
 
 builder.Services.AddHttpClient();
 builder.Services.AddMemoryCache();
-builder.Services.AddSingleton<IMySqlDao, MySqlDao>();
+builder.Services.AddSingleton<IMySqlDao>(new MySqlDao(Environment.GetEnvironmentVariable("SqlConnectionString")));
 builder.Services.AddSingleton<IHttpRequestor, HttpRequestor>();
 builder.Services.AddSingleton<IMappingService, MappingService>();
 

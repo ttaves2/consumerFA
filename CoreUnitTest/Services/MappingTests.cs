@@ -2,7 +2,7 @@ using System.Text.Json.Nodes;
 using Core.Services;
 using Jsonata.Net.Native;
 
-namespace CoreUnitTest;
+namespace CoreUnitTest.Services;
 
 public class MappingTests
 {

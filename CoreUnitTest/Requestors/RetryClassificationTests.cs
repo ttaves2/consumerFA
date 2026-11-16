@@ -1,7 +1,7 @@
 using System.Net;
 using Core.Requestors;
 
-namespace CoreUnitTest;
+namespace CoreUnitTest.Requestors;
 
 public class RetryClassificationTests
 {

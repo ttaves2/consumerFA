@@ -1,6 +1,6 @@
 using Core.Services;
 
-namespace CoreUnitTest;
+namespace CoreUnitTest.Services;
 
 public class TraceFieldTests
 {

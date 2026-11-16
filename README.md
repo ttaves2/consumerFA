@@ -29,6 +29,7 @@ redelivered once the lock lapses. `host.json` therefore sets
 | [VS Code](https://code.visualstudio.com/) | editor | `winget install Microsoft.VisualStudioCode` |
 | [Node.js](https://nodejs.org) | only needed for the standalone Azurite CLI | `winget install OpenJS.NodeJS.LTS` |
 | Docker Desktop | optional — for the local Service Bus emulator | `winget install Docker.DockerDesktop` |
+| [SQL Server Express LocalDB](https://learn.microsoft.com/sql/database-engine/configure-windows/sql-server-express-localdb) | optional — runs the `MySqlDao` tests, which are skipped without it | SQL Server Express installer → *Download Media* → *LocalDB* (no winget package) |
 
 Verify:
 
@@ -121,11 +122,21 @@ status code.
 dotnet test
 ```
 
-`CoreUnitTest` covers the JSONata mapping step — rename/aggregate, missing fields, and the
-two failure modes (malformed message, malformed mapping config) — plus `DestinationUrl`
-validation, the retry/dead-letter split, XML conversion including the XXE and
-entity-expansion guards, and which body fields reach Application Insights as dimensions. The SQL lookup and the outbound POST are not covered; they need a
-database and a listener.
+`CoreUnitTest` mirrors `Core`'s folders: the tests for `Core/Services/MappingService.cs` live
+in `CoreUnitTest/Services/`, and so on. New code goes in the same way.
+
+Each layer is tested against fakes of the one below it, through its interface:
+
+- **Functions** — what reaches the service, and that its answer completes, dead-letters, or
+  (when it throws) leaves the message unsettled.
+- **Services** — the whole pipeline with SQL and HTTP faked: every outcome, the settlement each
+  produces, exactly one outcome line per message, and config cached once per event name. The
+  helpers (XML conversion, JSONata, trace fields, truncation, archiving) have their own files.
+- **Requestors** — the POST against a stub handler: URL, body, content type, `Idempotency-Key`,
+  and which statuses retry.
+- **Daos** — the real query against a throwaway LocalDB database, created and dropped per run:
+  newest row wins, missing row and NULL columns fail by name. These are **skipped**, not
+  failed, where LocalDB isn't installed, so a skipped count there is expected.
 
 ## XML messages
 
@@ -273,14 +284,10 @@ traces
 | `Core/Program.cs` | host builder + DI; each interface is registered as a singleton |
 | `Core/host.json` | Functions host config |
 | `Core/Core.csproj` | the function app, and its package versions |
-| `CoreUnitTest/MappingTests.cs` | tests for the mapping step |
-| `CoreUnitTest/DestinationUrlTests.cs` | tests for DestinationUrl validation |
-| `CoreUnitTest/RetryClassificationTests.cs` | tests for which statuses retry vs dead-letter |
-| `CoreUnitTest/TruncateTests.cs` | tests for log/dead-letter truncation |
-| `CoreUnitTest/XmlConversionTests.cs` | tests for XML detection, conversion shapes and XXE |
-| `CoreUnitTest/TraceFieldTests.cs` | tests for which body fields become custom dimensions |
-| `CoreUnitTest/CustomDimensionTests.cs` | tests that scope keys survive the OpenTelemetry export |
-| `CoreUnitTest/BodyArchiveTests.cs` | tests for archiving large bodies to blob storage |
+| `CoreUnitTest/Functions/` | tests for the trigger binding and settlement |
+| `CoreUnitTest/Services/` | `MappingServiceTests` for the pipeline, plus one file per helper (mapping, XML, trace fields, archiving, truncation, URL validation, the scope export) |
+| `CoreUnitTest/Requestors/` | tests for the POST and retry classification |
+| `CoreUnitTest/Daos/` | tests for the config query, against LocalDB |
 | `consumerFA.slnx` | both projects |
 
 ## Notes
