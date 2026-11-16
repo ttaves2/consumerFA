@@ -123,8 +123,8 @@ dotnet test
 
 `CoreUnitTest` covers the JSONata mapping step — rename/aggregate, missing fields, and the
 two failure modes (malformed message, malformed mapping config) — plus `DestinationUrl`
-validation, the retry/dead-letter split, and XML conversion including the XXE and
-entity-expansion guards. The SQL lookup and the outbound POST are not covered; they need a
+validation, the retry/dead-letter split, XML conversion including the XXE and
+entity-expansion guards, and which body fields reach Application Insights as dimensions. The SQL lookup and the outbound POST are not covered; they need a
 database and a listener.
 
 ## XML messages
@@ -170,16 +170,48 @@ Every message produces exactly one log line, whatever happens to it, with these 
 | `Detail` | destination URL and status code, or the failure reason |
 | `ElapsedMs`, `DeliveryCount`, `EventName` | timing and redelivery context |
 
-`Body` is logged in full precisely so support does not need to know the field name: paste
-whatever id the caller quotes into the search and the message turns up.
+On top of those, **identifier fields from the body become custom dimensions of their own**,
+so they stay searchable even when the body is truncated. A field is picked up when its name:
+
+| Rule | Matches | Does not match |
+| --- | --- | --- |
+| is exactly `id` or `number` | `id`, `ID`, `number` | |
+| ends with `Id`/`ID`/`Number`/`NUMBER` | `orderId`, `orderID`, `accountNumber` | `isPaid`, `isValid`, `unpaid`, `hybrid` |
+| ends with `_id`/`-id`/`_number`/`-number` | `order_id`, `ORDER_ID`, `account-number` | |
+| all-lowercase suffix | | `orderid`, `phonenumber` |
+
+Requiring that boundary is what keeps `isPaid` and `isValid` out of the dimensions. The cost
+is that an all-lowercase `orderid` is missed - if your payloads use that style, relax
+`IsTraceField`.
+
+Fields are found at any nesting depth, including inside arrays, and XML attributes come
+through with their `@` prefix (`@OrderId`). Repeated names collapse into one dimension holding
+the distinct values (`lineId = "L1,L2"`) rather than one dimension per array element. At most
+10 fields are captured, each truncated at 200 chars, and a field is skipped if its name would
+shadow one of the fixed properties above.
+
+So support has two ways in. By a specific id, which survives truncation:
 
 ```kql
 traces
-| where customDimensions.Body contains "ORD-10044"
+| where customDimensions.orderId == "ORD-10044"
 | project timestamp, Outcome = customDimensions.Outcome, Detail = customDimensions.Detail,
           MessageId = customDimensions.MessageId, DeliveryCount = customDimensions.DeliveryCount
 | order by timestamp desc
 ```
+
+Or by anything at all in the body, which does not:
+
+```kql
+traces
+| where customDimensions.Body contains "ORD-10044"
+| project timestamp, Outcome = customDimensions.Outcome, Detail = customDimensions.Detail
+| order by timestamp desc
+```
+
+These dimensions travel as a log scope, so `Program.cs` must set `IncludeScopes = true`.
+Without it they are dropped silently, which is why `CustomDimensionTests` asserts both halves
+of that: that dynamic keys reach the record, and that they vanish when the flag is off.
 
 What each outcome means:
 
@@ -209,6 +241,8 @@ traces
 | `CoreUnitTest/RetryClassificationTests.cs` | tests for which statuses retry vs dead-letter |
 | `CoreUnitTest/TruncateTests.cs` | tests for log/dead-letter truncation |
 | `CoreUnitTest/XmlConversionTests.cs` | tests for XML detection, conversion shapes and XXE |
+| `CoreUnitTest/TraceFieldTests.cs` | tests for which body fields become custom dimensions |
+| `CoreUnitTest/CustomDimensionTests.cs` | tests that scope keys survive the OpenTelemetry export |
 | `consumerFA.slnx` | both projects |
 
 ## Notes
@@ -219,5 +253,5 @@ traces
 - Cache is TTL-only, no invalidation. Restart the host if you need a config change immediately. A semaphore keeps a cold start from opening one SQL connection per concurrent message.
 - Application Insights goes through OpenTelemetry: `UseFunctionsWorkerDefaults()` plus `UseAzureMonitorExporter()` in `Program.cs`, and `telemetryMode: OpenTelemetry` in `host.json`. It needs `APPLICATIONINSIGHTS_CONNECTION_STRING` set on the function app; without it the exporter is a no-op and logs still reach Application Insights through the host relay.
 - `AddHttpClientInstrumentation()` records the outbound POST as a dependency, so a slow or failing destination is visible in the trace. SQL is not instrumented - it is one cached query per 5 minutes. Add `OpenTelemetry.Instrumentation.SqlClient` if that changes.
-- Bodies are logged. Anything sensitive in a message lands in Application Insights and is kept for the workspace retention period.
+- Bodies are logged, and id/number fields are promoted to queryable dimensions. Anything sensitive in a message lands in Application Insights for the workspace retention period, and a field like `phoneNumber` or `taxId` becomes easy to query at scale - narrow `IsTraceField` if that matters more than searchability.
 - `DestinationUrl` must be an absolute `http`/`https` URL; anything else fails the config load with an error naming the row. The scheme is all that's checked, so keep write access to `InboundMappingConfig` restricted — a valid URL can still point somewhere internal.

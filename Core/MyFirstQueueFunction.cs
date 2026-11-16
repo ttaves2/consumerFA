@@ -1,6 +1,8 @@
 using System.Diagnostics;
 using System.Net;
 using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Xml;
 using Azure.Messaging.ServiceBus;
 using Newtonsoft.Json;
@@ -25,6 +27,10 @@ public class MyFirstQueueFunction(
     // Enough to hold the body App Insights is searched by; its custom dimensions cap out at 8192.
     private const int MaxBodyChars = 4000;
 
+    // A batch payload can carry hundreds of ids; keep the dimension count and each value bounded.
+    private const int MaxTraceFields = 10;
+    private const int MaxTraceValueChars = 200;
+
     // ponytail: TTL, not invalidation. Config edits go live within 5 min; shorten if that's too slow.
     private static readonly TimeSpan ConfigTtl = TimeSpan.FromMinutes(5);
 
@@ -44,6 +50,29 @@ public class MyFirstQueueFunction(
         var raw = message.Body.ToString();
         var body = Truncate(raw, MaxBodyChars);
 
+        // Convert before anything else, so the id fields below are available to every outcome
+        // and not just the ones that get as far as mapping.
+        string json;
+        try
+        {
+            json = ToJson(raw);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            Log(LogLevel.Error, ex, message, "DeadLettered", started, body,
+                "Body is neither valid JSON nor valid XML: " + ex.Message);
+            await messageActions.DeadLetterMessageAsync(
+                message,
+                deadLetterReason: "UnreadableBody",
+                deadLetterErrorDescription: Truncate(ex.Message, MaxReasonChars),
+                cancellationToken: cancellationToken);
+            return;
+        }
+
+        // Every log line from here on carries the body's id/number fields as custom dimensions.
+        // Program.cs must set IncludeScopes, or they are dropped silently.
+        using var traceFields = logger.BeginScope(ExtractTraceFields(json));
+
         (JsonataQuery Query, Uri DestinationUrl) config;
         try
         {
@@ -60,11 +89,11 @@ public class MyFirstQueueFunction(
         string mapped;
         try
         {
-            mapped = Map(config.Query, ToJson(raw));
+            mapped = Map(config.Query, json);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            // The body, the XML, or the mapping is wrong; replaying it will fail identically.
+            // The body or the mapping is wrong; replaying it will fail identically.
             Log(LogLevel.Error, ex, message, "DeadLettered", started, body, "Mapping failed: " + ex.Message);
             await messageActions.DeadLetterMessageAsync(
                 message,
@@ -174,6 +203,92 @@ public class MyFirstQueueFunction(
 
     public static string Truncate(string value, int max) =>
         value.Length <= max ? value : string.Concat(value.AsSpan(0, max), "...[truncated]");
+
+    /// <summary>Property names this class already logs; an extracted field never overwrites one.</summary>
+    private static readonly HashSet<string> ReservedNames =
+        new(StringComparer.OrdinalIgnoreCase)
+        { "MessageId", "Outcome", "ElapsedMs", "DeliveryCount", "Detail", "EventName", "Body" };
+
+    /// <summary>
+    /// Pulls identifier-ish leaf fields out of a JSON body so each becomes its own custom
+    /// dimension in Application Insights, searchable without knowing the payload shape and
+    /// without depending on the body surviving truncation.
+    /// <para>
+    /// A field matches when its name is exactly <c>id</c>/<c>number</c>, ends with <c>Id</c>,
+    /// <c>ID</c>, <c>Number</c> or <c>NUMBER</c>, or ends with <c>_id</c>/<c>-id</c>/
+    /// <c>_number</c>/<c>-number</c>. Requiring that boundary is what keeps <c>isPaid</c> and
+    /// <c>isValid</c> out; an all-lowercase <c>orderid</c> is not matched either.
+    /// </para>
+    /// </summary>
+    public static List<KeyValuePair<string, object?>> ExtractTraceFields(
+        string json, int maxFields = MaxTraceFields, int maxValueChars = MaxTraceValueChars)
+    {
+        var found = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            Walk(JsonNode.Parse(json), found, maxFields);
+        }
+        catch (System.Text.Json.JsonException)
+        {
+            // Not JSON, or not parseable. The body is logged regardless; nothing to extract.
+        }
+
+        return found
+            .Select(pair => new KeyValuePair<string, object?>(
+                pair.Key, Truncate(string.Join(",", pair.Value), maxValueChars)))
+            .ToList();
+    }
+
+    private static void Walk(JsonNode? node, Dictionary<string, List<string>> found, int maxFields)
+    {
+        switch (node)
+        {
+            case JsonObject obj:
+                foreach (var (name, child) in obj)
+                {
+                    if (child is JsonObject or JsonArray)
+                    {
+                        Walk(child, found, maxFields);
+                    }
+                    else if (child is JsonValue && IsTraceField(name) && !ReservedNames.Contains(name))
+                    {
+                        // Arrays of records repeat a name, so collect distinct values under one key
+                        // rather than emitting lineId, lineId, lineId as separate dimensions.
+                        var values = found.TryGetValue(name, out var existing) ? existing : null;
+                        if (values is null)
+                        {
+                            if (found.Count >= maxFields) continue;
+                            found[name] = values = [];
+                        }
+
+                        var value = child.ToString();
+                        if (!values.Contains(value)) values.Add(value);
+                    }
+                }
+
+                break;
+
+            case JsonArray array:
+                foreach (var item in array) Walk(item, found, maxFields);
+                break;
+        }
+    }
+
+    private static bool IsTraceField(string name)
+    {
+        // XML attributes arrive as "@orderId"; the prefix must not hide the suffix below.
+        var bare = name.TrimStart('@');
+
+        return Matches(bare, "id") || Matches(bare, "number");
+
+        static bool Matches(string name, string suffix) =>
+            name.Equals(suffix, StringComparison.OrdinalIgnoreCase)
+            // "Id"/"ID", never the "id" of isPaid or isValid.
+            || name.EndsWith(char.ToUpperInvariant(suffix[0]) + suffix[1..], StringComparison.Ordinal)
+            || name.EndsWith(suffix.ToUpperInvariant(), StringComparison.Ordinal)
+            || name.EndsWith("_" + suffix, StringComparison.OrdinalIgnoreCase)
+            || name.EndsWith("-" + suffix, StringComparison.OrdinalIgnoreCase);
+    }
 
     private async Task<(JsonataQuery Query, Uri DestinationUrl)> GetConfigAsync(CancellationToken cancellationToken)
     {
