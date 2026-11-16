@@ -6,6 +6,10 @@ Azure Function App (.NET 10, isolated worker). One function:
 `EventName = 'myFirstQueue'` → run the message through the row's JSONata
 `MappingConfig` → POST the result to the row's `DestinationUrl`.
 
+If several rows share an `EventName`, the highest `Id` wins. Each POST carries an
+`Idempotency-Key` header holding the Service Bus `MessageId`, so a destination can
+dedupe the redeliveries that follow any failure.
+
 Config (mapping + URL) is cached in memory for 5 minutes, so edits to the table go
 live within 5 minutes without a restart. A non-2xx response throws, which lets
 Service Bus retry and eventually dead-letter the message.
@@ -111,8 +115,9 @@ dotnet test
 ```
 
 `CoreUnitTest` covers the JSONata mapping step — rename/aggregate, missing fields, and the
-two failure modes (malformed message, malformed mapping config). The SQL lookup and the
-outbound POST are not covered; they need a database and a listener.
+two failure modes (malformed message, malformed mapping config) — plus `DestinationUrl`
+validation. The SQL lookup and the outbound POST are not covered; they need a database
+and a listener.
 
 ## Layout
 
@@ -123,6 +128,7 @@ outbound POST are not covered; they need a database and a listener.
 | `Core/host.json` | Functions host config |
 | `Core/Core.csproj` | the function app, and its package versions |
 | `CoreUnitTest/MappingTests.cs` | tests for the mapping step |
+| `CoreUnitTest/DestinationUrlTests.cs` | tests for DestinationUrl validation |
 | `consumerFA.slnx` | both projects |
 
 ## Notes
@@ -130,3 +136,5 @@ outbound POST are not covered; they need a database and a listener.
 - JSONata is [Jsonata.Net.Native](https://github.com/mikhail-barg/jsonata.net.native). Its `Eval` returns pretty-printed JSON; harmless over HTTP.
 - No retry policy on the outbound POST — Service Bus redelivery covers it. Reach for Polly if the destination flaps.
 - Cache is TTL-only, no invalidation. Restart the host if you need a config change immediately.
+- `DestinationUrl` must be an absolute `http`/`https` URL; anything else fails the config load with an error naming the row. The scheme is all that's checked, so keep write access to `InboundMappingConfig` restricted — a valid URL can still point somewhere internal.
+- A 4xx from the destination is retried like a 5xx, so a permanently bad payload burns the full delivery count before dead-lettering.
