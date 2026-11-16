@@ -1,11 +1,11 @@
-using Core;
+using Core.Services;
 
 namespace CoreUnitTest;
 
 public class TraceFieldTests
 {
     private static Dictionary<string, object?> Extract(string json) =>
-        MyFirstQueueFunction.ExtractTraceFields(json).ToDictionary(p => p.Key, p => p.Value);
+        MappingService.ExtractTraceFields(json).ToDictionary(p => p.Key, p => p.Value);
 
     [Theory]
     [InlineData("""{"orderId":"A1"}""", "orderId")]
@@ -34,7 +34,7 @@ public class TraceFieldTests
     [InlineData("""{"orderid":"A1"}""")]
     [InlineData("""{"phonenumber":"555"}""")]
     public void DoesNotMatch(string json) =>
-        Assert.Empty(MyFirstQueueFunction.ExtractTraceFields(json));
+        Assert.Empty(MappingService.ExtractTraceFields(json));
 
     [Fact]
     public void FindsFieldsNestedAtAnyDepth()
@@ -60,7 +60,7 @@ public class TraceFieldTests
 
     [Fact]
     public void SkipsNonScalarValues() =>
-        Assert.Empty(MyFirstQueueFunction.ExtractTraceFields("""{"id":{"nested":"A1"}}"""));
+        Assert.Empty(MappingService.ExtractTraceFields("""{"id":{"nested":"A1"}}"""));
 
     [Fact]
     public void SkipsNamesItAlreadyLogs()
@@ -76,7 +76,7 @@ public class TraceFieldTests
     {
         var json = "{" + string.Join(",", Enumerable.Range(0, 50).Select(i => $"\"f{i}Id\":\"v{i}\"")) + "}";
 
-        Assert.Equal(10, MyFirstQueueFunction.ExtractTraceFields(json).Count);
+        Assert.Equal(10, MappingService.ExtractTraceFields(json).Count);
     }
 
     [Fact]
@@ -84,7 +84,7 @@ public class TraceFieldTests
     {
         var json = $"{{\"orderId\":\"{new string('x', 500)}\"}}";
 
-        var value = (string)Assert.Single(MyFirstQueueFunction.ExtractTraceFields(json)).Value!;
+        var value = (string)Assert.Single(MappingService.ExtractTraceFields(json)).Value!;
 
         Assert.StartsWith(new string('x', 200), value);
         Assert.EndsWith("...[truncated]", value);
@@ -95,7 +95,7 @@ public class TraceFieldTests
     [InlineData("")]
     [InlineData("{broken")]
     public void ReturnsNothingRatherThanThrowingOnUnparseableInput(string json) =>
-        Assert.Empty(MyFirstQueueFunction.ExtractTraceFields(json));
+        Assert.Empty(MappingService.ExtractTraceFields(json));
 
     [Fact]
     public void KeepsNumericAndBooleanValues()
@@ -109,7 +109,7 @@ public class TraceFieldTests
     [Fact]
     public void ExtractsFromConvertedXml()
     {
-        var fields = Extract(MyFirstQueueFunction.ToJson(
+        var fields = Extract(MappingService.ToJson(
             """<order OrderId="O1"><customerNumber>C2</customerNumber></order>"""));
 
         Assert.Equal("O1", fields["@OrderId"]);

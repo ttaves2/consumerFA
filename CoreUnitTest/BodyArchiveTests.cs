@@ -1,5 +1,5 @@
 using Azure.Storage.Blobs;
-using Core;
+using Core.Services;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace CoreUnitTest;
@@ -16,7 +16,7 @@ public class BodyArchiveTests
             new BlobClientOptions { Retry = { MaxRetries = 0 } });
 
     private static Task<string> BodyForLog(BlobContainerClient? archive, string raw) =>
-        MyFirstQueueFunction.BodyForLogAsync(archive, raw, "sb-1", NullLogger.Instance, default);
+        MappingService.BodyForLogAsync(archive, raw, "sb-1", NullLogger.Instance, default);
 
     [Fact]
     public async Task ShortBodiesAreLoggedWholeAndNeverTouchStorage()
@@ -49,7 +49,7 @@ public class BodyArchiveTests
     [Fact]
     public void AConnectionStringWins()
     {
-        var client = MyFirstQueueFunction.ArchiveClient(
+        var client = MappingService.ArchiveClient(
             "DefaultEndpointsProtocol=http;AccountName=dev;AccountKey=Zm9v;BlobEndpoint=http://127.0.0.1:1/dev;",
             blobServiceUri: "https://ignored.blob.core.windows.net",
             accountName: "ignored");
@@ -61,7 +61,7 @@ public class BodyArchiveTests
     public void AnAccountNameAloneIsEnough()
     {
         // The deployed form: AzureWebJobsStorage__accountName with no connection string anywhere.
-        var client = MyFirstQueueFunction.ArchiveClient(null, null, accountName: "prodstorage");
+        var client = MappingService.ArchiveClient(null, null, accountName: "prodstorage");
 
         Assert.Equal(
             "https://prodstorage.blob.core.windows.net/message-bodies", client!.Uri.ToString());
@@ -72,12 +72,12 @@ public class BodyArchiveTests
         // Deriving the host from the account name hardcodes the public cloud's suffix.
         Assert.Equal(
             "https://prodstorage.blob.core.chinacloudapi.cn/message-bodies",
-            MyFirstQueueFunction.ArchiveClient(
+            MappingService.ArchiveClient(
                 null,
                 "https://prodstorage.blob.core.chinacloudapi.cn/",
                 "prodstorage")!.Uri.ToString());
 
     [Fact]
     public void NoStorageSettingAtAllDisablesArchiving() =>
-        Assert.Null(MyFirstQueueFunction.ArchiveClient(null, null, null));
+        Assert.Null(MappingService.ArchiveClient(null, null, null));
 }

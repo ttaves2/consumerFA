@@ -1,5 +1,5 @@
 using System.Text.Json.Nodes;
-using Core;
+using Core.Services;
 using Jsonata.Net.Native;
 
 namespace CoreUnitTest;
@@ -16,7 +16,7 @@ public class MappingTests
     {
         var query = new JsonataQuery("""{"id": orderId, "total": $sum(lines.amount)}""");
 
-        var result = MyFirstQueueFunction.Map(query, """{"orderId":"A1","lines":[{"amount":2},{"amount":3}]}""");
+        var result = MappingService.Map(query, """{"orderId":"A1","lines":[{"amount":2},{"amount":3}]}""");
 
         AssertJsonEqual("""{"id":"A1","total":5}""", result);
     }
@@ -26,7 +26,7 @@ public class MappingTests
     {
         var query = new JsonataQuery("""{"id": orderId, "note": missingField}""");
 
-        var result = MyFirstQueueFunction.Map(query, """{"orderId":"A1"}""");
+        var result = MappingService.Map(query, """{"orderId":"A1"}""");
 
         AssertJsonEqual("""{"id":"A1"}""", result);
     }
@@ -36,7 +36,7 @@ public class MappingTests
     {
         var query = new JsonataQuery("""{"id": orderId}""");
 
-        Assert.ThrowsAny<Exception>(() => MyFirstQueueFunction.Map(query, "not json"));
+        Assert.ThrowsAny<Exception>(() => MappingService.Map(query, "not json"));
     }
 
     [Fact]

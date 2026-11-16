@@ -1,5 +1,5 @@
 using System.Text.Json.Nodes;
-using Core;
+using Core.Services;
 using Jsonata.Net.Native;
 
 namespace CoreUnitTest;
@@ -17,41 +17,41 @@ public class XmlConversionTests
     [InlineData("""[1,2,3]""")]
     [InlineData("\"just a string\"")]
     public void ToJson_PassesJsonThrough(string body) =>
-        Assert.Equal(body, MyFirstQueueFunction.ToJson(body));
+        Assert.Equal(body, MappingService.ToJson(body));
 
     [Fact]
     public void ToJson_KeepsTheRootElement() =>
         AssertJsonEqual(
             """{"order":{"id":"1"}}""",
-            MyFirstQueueFunction.ToJson("<order><id>1</id></order>"));
+            MappingService.ToJson("<order><id>1</id></order>"));
 
     [Fact]
     public void ToJson_PrefixesAttributesWithAt() =>
         AssertJsonEqual(
             """{"order":{"@id":"1","note":"hi"}}""",
-            MyFirstQueueFunction.ToJson("""<order id="1"><note>hi</note></order>"""));
+            MappingService.ToJson("""<order id="1"><note>hi</note></order>"""));
 
     [Fact]
     public void ToJson_TurnsRepeatedElementsIntoAnArray() =>
         AssertJsonEqual(
             """{"lines":{"line":["a","b"]}}""",
-            MyFirstQueueFunction.ToJson("<lines><line>a</line><line>b</line></lines>"));
+            MappingService.ToJson("<lines><line>a</line><line>b</line></lines>"));
 
     [Fact]
     public void ToJson_LeavesASingleRepeatedElementScalar() =>
         AssertJsonEqual(
             """{"lines":{"line":"a"}}""",
-            MyFirstQueueFunction.ToJson("<lines><line>a</line></lines>"));
+            MappingService.ToJson("<lines><line>a</line></lines>"));
 
     [Theory]
     [InlineData("\uFEFF<order><id>1</id></order>")]          // byte order mark
     [InlineData("  \r\n\t<order><id>1</id></order>")]         // leading whitespace
     public void ToJson_DetectsXmlBehindLeadingNoise(string body) =>
-        Assert.Contains("\"order\"", MyFirstQueueFunction.ToJson(body));
+        Assert.Contains("\"order\"", MappingService.ToJson(body));
 
     [Fact]
     public void ToJson_ThrowsOnMalformedXml() =>
-        Assert.ThrowsAny<Exception>(() => MyFirstQueueFunction.ToJson("<order><id>1</id>"));
+        Assert.ThrowsAny<Exception>(() => MappingService.ToJson("<order><id>1</id>"));
 
     [Fact]
     public void ToJson_RejectsDoctypeSoXxeCannotReadFiles()
@@ -62,7 +62,7 @@ public class XmlConversionTests
             <order><id>&xxe;</id></order>
             """;
 
-        Assert.ThrowsAny<Exception>(() => MyFirstQueueFunction.ToJson(attack));
+        Assert.ThrowsAny<Exception>(() => MappingService.ToJson(attack));
     }
 
     [Fact]
@@ -78,7 +78,7 @@ public class XmlConversionTests
             <lolz>&lol3;</lolz>
             """;
 
-        Assert.ThrowsAny<Exception>(() => MyFirstQueueFunction.ToJson(bomb));
+        Assert.ThrowsAny<Exception>(() => MappingService.ToJson(bomb));
     }
 
     [Fact]
@@ -88,7 +88,7 @@ public class XmlConversionTests
         var query = new JsonataQuery(
             """{"id": order.id, "total": $sum(order.lines.line.amount.$number($))}""");
 
-        var mapped = MyFirstQueueFunction.Map(query, MyFirstQueueFunction.ToJson(
+        var mapped = MappingService.Map(query, MappingService.ToJson(
             """
             <order><id>A1</id><lines>
               <line><amount>2</amount></line>
@@ -105,6 +105,6 @@ public class XmlConversionTests
         // sits beside the root rather than wrapping it, so order.id is unaffected.
         AssertJsonEqual(
             """{"?xml":{"@version":"1.0","@encoding":"utf-8"},"order":{"id":"1"}}""",
-            MyFirstQueueFunction.ToJson(
+            MappingService.ToJson(
                 """<?xml version="1.0" encoding="utf-8"?><order><id>1</id></order>"""));
 }

@@ -1,5 +1,5 @@
 using System.Net;
-using Core;
+using Core.Requestors;
 
 namespace CoreUnitTest;
 
@@ -13,7 +13,7 @@ public class RetryClassificationTests
     [InlineData(HttpStatusCode.RequestTimeout)]   // 408 - 4xx, but means "try again"
     [InlineData(HttpStatusCode.TooManyRequests)]  // 429 - ditto
     public void Retryable(HttpStatusCode status) =>
-        Assert.True(MyFirstQueueFunction.IsRetryable(status));
+        Assert.True(HttpRequestor.IsRetryable(status));
 
     [Theory]
     [InlineData(HttpStatusCode.BadRequest)]
@@ -24,5 +24,5 @@ public class RetryClassificationTests
     [InlineData(HttpStatusCode.UnsupportedMediaType)]
     [InlineData(HttpStatusCode.UnprocessableEntity)]
     public void NotRetryable(HttpStatusCode status) =>
-        Assert.False(MyFirstQueueFunction.IsRetryable(status));
+        Assert.False(HttpRequestor.IsRetryable(status));
 }

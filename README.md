@@ -182,7 +182,7 @@ so they stay searchable even when the body is truncated. A field is picked up wh
 
 Requiring that boundary is what keeps `isPaid` and `isValid` out of the dimensions. The cost
 is that an all-lowercase `orderid` is missed - if your payloads use that style, relax
-`IsTraceField`.
+`IsTraceField` in `MappingService`.
 
 Fields are found at any nesting depth, including inside arrays, and XML attributes come
 through with their `@` prefix (`@OrderId`). Repeated names collapse into one dimension holding
@@ -266,7 +266,10 @@ traces
 
 | Path | What's in it |
 | --- | --- |
-| `Core/MyFirstQueueFunction.cs` | the whole pipeline: trigger, SQL lookup, cache, JSONata, POST |
+| `Core/Functions/MyFirstQueueFunction.cs` | the Service Bus trigger: hands the body to the service, then completes or dead-letters |
+| `Core/Services/MappingService.cs` | the pipeline: XML conversion, config cache, JSONata, outcome logging, body archiving |
+| `Core/Daos/MySqlDao.cs` | the `InboundMappingConfig` query |
+| `Core/Requestors/HttpRequestor.cs` | the POST to `DestinationUrl`, and which statuses are retryable |
 | `Core/Program.cs` | host builder + DI |
 | `Core/host.json` | Functions host config |
 | `Core/Core.csproj` | the function app, and its package versions |

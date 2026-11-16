@@ -1,4 +1,4 @@
-using Core;
+using Core.Services;
 using Microsoft.Extensions.Logging;
 using OpenTelemetry;
 using OpenTelemetry.Logs;
@@ -45,7 +45,7 @@ public class CustomDimensionTests
         var (records, logger, provider) = BuildLogger();
         using (provider)
         {
-            var extracted = MyFirstQueueFunction.ExtractTraceFields(
+            var extracted = MappingService.ExtractTraceFields(
                 """{"orderId":"ORD-10044","accountNumber":"AC-7"}""");
 
             using (logger.BeginScope(extracted))
@@ -76,7 +76,7 @@ public class CustomDimensionTests
 
         var logger = factory.CreateLogger("test");
         using (logger.BeginScope(
-            MyFirstQueueFunction.ExtractTraceFields("""{"orderId":"ORD-10044"}""")))
+            MappingService.ExtractTraceFields("""{"orderId":"ORD-10044"}""")))
         {
             logger.LogInformation("hello");
         }

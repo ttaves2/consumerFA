@@ -1,28 +1,35 @@
 using System.Diagnostics;
-using System.Net;
-using System.Text;
-using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Xml;
-using Azure.Messaging.ServiceBus;
 using Azure.Identity;
 using Azure.Storage.Blobs;
-using Newtonsoft.Json;
+using Core.Daos;
+using Core.Requestors;
 using Jsonata.Net.Native;
-using Microsoft.Azure.Functions.Worker;
-using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Logging;
+using Newtonsoft.Json;
 
-namespace Core;
+namespace Core.Services;
 
-public class MyFirstQueueFunction(
-    IHttpClientFactory httpClientFactory,
-    IMemoryCache cache,
-    ILogger<MyFirstQueueFunction> logger)
+/// <summary>How to settle a message. Failures worth retrying throw instead of returning one.</summary>
+public sealed record ProcessResult(string? DeadLetterReason = null, string? DeadLetterDescription = null)
 {
-    private const string QueueName = "myFirstQueue";
+    public static readonly ProcessResult Delivered = new();
 
+    public bool IsDelivered => DeadLetterReason is null;
+}
+
+/// <summary>
+/// The pipeline, independent of what triggered it: convert the body to JSON, load the event's
+/// mapping, apply it, and POST the result. Any trigger can call it with its own event name.
+/// </summary>
+public class MappingService(
+    MySqlDao dao,
+    HttpRequestor requestor,
+    IMemoryCache cache,
+    ILogger<MappingService> logger)
+{
     // Service Bus caps the dead-letter description at 4096 chars and rejects the settlement above it.
     private const int MaxReasonChars = 1000;
 
@@ -40,20 +47,32 @@ public class MyFirstQueueFunction(
     private static readonly TimeSpan ConfigTtl = TimeSpan.FromMinutes(5);
 
     // One loader at a time per instance, so a cold start doesn't open maxConcurrentCalls connections.
+    // ponytail: one lock across every event name. Key it per event if many queues cold-start at once.
     private static readonly SemaphoreSlim ConfigLock = new(1, 1);
 
-    // host.json sets autoCompleteMessages: false, so every path below must settle the message.
-    // Every path also emits exactly one Log(...) line carrying Outcome and Body, which is what
-    // support searches on. See the "Tracing a message" section of the README.
-    [Function(nameof(MyFirstQueueFunction))]
-    public async Task Run(
-        [ServiceBusTrigger(QueueName, Connection = "ServiceBusConnection")] ServiceBusReceivedMessage message,
-        ServiceBusMessageActions messageActions,
+    /// <summary>
+    /// Runs one message through the pipeline. Returns how to settle it, or throws when it
+    /// should come back later (config unavailable, or a destination status worth retrying).
+    /// <para>
+    /// Every call emits exactly one outcome line carrying Outcome and Body, which is what
+    /// support searches on. See the "Tracing a message" section of the README.
+    /// </para>
+    /// </summary>
+    public async Task<ProcessResult> ProcessAsync(
+        string eventName, string messageId, int deliveryCount, string raw,
         CancellationToken cancellationToken)
     {
         var started = Stopwatch.GetTimestamp();
-        var raw = message.Body.ToString();
-        var body = await BodyForLogAsync(Archive.Value, raw, message.MessageId, logger, cancellationToken);
+        var body = await BodyForLogAsync(Archive.Value, raw, messageId, logger, cancellationToken);
+
+        // Outcome is one of Succeeded, Retrying, DeadLettered or ConfigUnavailable.
+        void Log(LogLevel level, Exception? ex, string outcome, string detail) =>
+            logger.Log(
+                level, ex,
+                "Message {MessageId} {Outcome} after {ElapsedMs}ms on delivery {DeliveryCount}. "
+                + "{Detail} EventName={EventName} Body={Body}",
+                messageId, outcome, (long)Stopwatch.GetElapsedTime(started).TotalMilliseconds,
+                deliveryCount, detail, eventName, body);
 
         // Convert before anything else, so the id fields below are available to every outcome
         // and not just the ones that get as far as mapping.
@@ -64,14 +83,8 @@ public class MyFirstQueueFunction(
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            Log(LogLevel.Error, ex, message, "DeadLettered", started, body,
-                "Body is neither valid JSON nor valid XML: " + ex.Message);
-            await messageActions.DeadLetterMessageAsync(
-                message,
-                deadLetterReason: "UnreadableBody",
-                deadLetterErrorDescription: Truncate(ex.Message, MaxReasonChars),
-                cancellationToken: cancellationToken);
-            return;
+            Log(LogLevel.Error, ex, "DeadLettered", "Body is neither valid JSON nor valid XML: " + ex.Message);
+            return new("UnreadableBody", Truncate(ex.Message, MaxReasonChars));
         }
 
         // Every log line from here on carries the body's id/number fields as custom dimensions.
@@ -81,13 +94,13 @@ public class MyFirstQueueFunction(
         (JsonataQuery Query, Uri DestinationUrl) config;
         try
         {
-            config = await GetConfigAsync(cancellationToken);
+            config = await GetConfigAsync(eventName, cancellationToken);
         }
         catch (Exception ex)
         {
-            // Transient (SQL down, row not deployed yet). Leave the message unsettled so it comes
-            // back when the lock lapses, rather than dead-lettering a working payload.
-            Log(LogLevel.Error, ex, message, "ConfigUnavailable", started, body, ex.Message);
+            // Transient (SQL down, row not deployed yet). Throwing leaves the message unsettled so
+            // it comes back when the lock lapses, rather than dead-lettering a working payload.
+            Log(LogLevel.Error, ex, "ConfigUnavailable", ex.Message);
             throw;
         }
 
@@ -99,73 +112,32 @@ public class MyFirstQueueFunction(
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             // The body or the mapping is wrong; replaying it will fail identically.
-            Log(LogLevel.Error, ex, message, "DeadLettered", started, body, "Mapping failed: " + ex.Message);
-            await messageActions.DeadLetterMessageAsync(
-                message,
-                deadLetterReason: "MappingFailed",
-                deadLetterErrorDescription: Truncate(ex.Message, MaxReasonChars),
-                cancellationToken: cancellationToken);
-            return;
+            Log(LogLevel.Error, ex, "DeadLettered", "Mapping failed: " + ex.Message);
+            return new("MappingFailed", Truncate(ex.Message, MaxReasonChars));
         }
 
-        using var request = new HttpRequestMessage(HttpMethod.Post, config.DestinationUrl)
-        {
-            Content = new StringContent(mapped, Encoding.UTF8, "application/json")
-        };
-        // Service Bus redelivers on any failure, so the destination needs a stable key to dedupe on.
-        request.Headers.TryAddWithoutValidation("Idempotency-Key", message.MessageId);
+        var response = await requestor.PostJsonAsync(config.DestinationUrl, mapped, messageId, cancellationToken);
+        var status = (int)response.Status;
 
-        using var response = await httpClientFactory.CreateClient().SendAsync(request, cancellationToken);
-        var status = (int)response.StatusCode;
-
-        if (response.IsSuccessStatusCode)
+        if (response.IsSuccess)
         {
-            await messageActions.CompleteMessageAsync(message, cancellationToken);
-            Log(LogLevel.Information, null, message, "Succeeded", started, body,
-                $"POST {config.DestinationUrl} returned {status}");
-            return;
+            Log(LogLevel.Information, null, "Succeeded", $"POST {config.DestinationUrl} returned {status}");
+            return ProcessResult.Delivered;
         }
 
-        var responseBody = Truncate(await response.Content.ReadAsStringAsync(cancellationToken), MaxReasonChars);
+        var responseBody = Truncate(response.Body, MaxReasonChars);
 
-        if (IsRetryable(response.StatusCode))
+        if (HttpRequestor.IsRetryable(response.Status))
         {
-            Log(LogLevel.Warning, null, message, "Retrying", started, body,
+            Log(LogLevel.Warning, null, "Retrying",
                 $"POST {config.DestinationUrl} returned {status}: {responseBody}");
             throw new HttpRequestException($"Destination returned {status}, will retry.");
         }
 
-        Log(LogLevel.Error, null, message, "DeadLettered", started, body,
+        Log(LogLevel.Error, null, "DeadLettered",
             $"POST {config.DestinationUrl} returned {status}: {responseBody}");
-        await messageActions.DeadLetterMessageAsync(
-            message,
-            deadLetterReason: $"Destination returned {status}",
-            deadLetterErrorDescription: responseBody,
-            cancellationToken: cancellationToken);
+        return new($"Destination returned {status}", responseBody);
     }
-
-    /// <summary>
-    /// The one log line per message that support traces on. Outcome is one of Succeeded,
-    /// Retrying, DeadLettered or ConfigUnavailable; Body carries the inbound payload so any id
-    /// inside it is searchable without knowing the field name.
-    /// </summary>
-    private void Log(
-        LogLevel level, Exception? ex, ServiceBusReceivedMessage message,
-        string outcome, long started, string body, string detail) =>
-        logger.Log(
-            level, ex,
-            "Message {MessageId} {Outcome} after {ElapsedMs}ms on delivery {DeliveryCount}. "
-            + "{Detail} EventName={EventName} Body={Body}",
-            message.MessageId, outcome, (long)Stopwatch.GetElapsedTime(started).TotalMilliseconds,
-            message.DeliveryCount, detail, QueueName, body);
-
-    /// <summary>
-    /// True when replaying the same request could plausibly succeed. 408 and 429 are 4xx but
-    /// explicitly mean "try again"; every other 4xx is the destination rejecting this payload.
-    /// </summary>
-    public static bool IsRetryable(HttpStatusCode status) =>
-        (int)status >= 500
-        || status is HttpStatusCode.RequestTimeout or HttpStatusCode.TooManyRequests;
 
     /// <summary>Applies a compiled JSONata mapping to a message body.</summary>
     public static string Map(JsonataQuery query, string message) => query.Eval(message);
@@ -368,18 +340,22 @@ public class MyFirstQueueFunction(
             || name.EndsWith("-" + suffix, StringComparison.OrdinalIgnoreCase);
     }
 
-    private async Task<(JsonataQuery Query, Uri DestinationUrl)> GetConfigAsync(CancellationToken cancellationToken)
+    private async Task<(JsonataQuery Query, Uri DestinationUrl)> GetConfigAsync(
+        string eventName, CancellationToken cancellationToken)
     {
-        if (cache.TryGetValue(QueueName, out (JsonataQuery, Uri) config)) return config;
+        if (cache.TryGetValue(eventName, out (JsonataQuery, Uri) config)) return config;
 
         await ConfigLock.WaitAsync(cancellationToken);
         try
         {
-            if (cache.TryGetValue(QueueName, out config)) return config;
+            if (cache.TryGetValue(eventName, out config)) return config;
 
-            logger.LogInformation("Loading mapping config for {EventName}", QueueName);
-            config = await LoadConfigAsync(QueueName, cancellationToken);
-            cache.Set(QueueName, config, ConfigTtl);
+            logger.LogInformation("Loading mapping config for {EventName}", eventName);
+            var row = await dao.GetInboundMappingConfigAsync(eventName, cancellationToken);
+
+            // Compile and validate once per load, not per message.
+            config = (new JsonataQuery(row.MappingConfig), ParseDestination(row.DestinationUrl, eventName));
+            cache.Set(eventName, config, ConfigTtl);
             return config;
         }
         finally
@@ -387,38 +363,4 @@ public class MyFirstQueueFunction(
             ConfigLock.Release();
         }
     }
-
-    private static async Task<(JsonataQuery Query, Uri DestinationUrl)> LoadConfigAsync(
-        string eventName, CancellationToken cancellationToken)
-    {
-        await using var connection = new SqlConnection(
-            Environment.GetEnvironmentVariable("SqlConnectionString")
-            ?? throw new InvalidOperationException("SqlConnectionString is not configured."));
-        await connection.OpenAsync(cancellationToken);
-
-        // TOP 1 + ORDER BY: EventName has no unique constraint, so without this the row is arbitrary.
-        await using var command = new SqlCommand(
-            """
-            SELECT TOP 1 MappingConfig, DestinationUrl
-            FROM InboundMappingConfig
-            WHERE EventName = @eventName
-            ORDER BY Id DESC
-            """,
-            connection);
-        command.Parameters.Add("@eventName", System.Data.SqlDbType.NVarChar, 260).Value = eventName;
-
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-        if (!await reader.ReadAsync(cancellationToken))
-            throw new InvalidOperationException($"No InboundMappingConfig row for EventName '{eventName}'.");
-
-        return (
-            new JsonataQuery(Required(reader, 0, "MappingConfig", eventName)),
-            ParseDestination(Required(reader, 1, "DestinationUrl", eventName), eventName));
-    }
-
-    private static string Required(SqlDataReader reader, int ordinal, string column, string eventName) =>
-        reader.IsDBNull(ordinal)
-            ? throw new InvalidOperationException(
-                $"InboundMappingConfig.{column} is NULL for EventName '{eventName}'.")
-            : reader.GetString(ordinal);
 }

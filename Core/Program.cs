@@ -1,4 +1,7 @@
 using Azure.Monitor.OpenTelemetry.Exporter;
+using Core.Daos;
+using Core.Requestors;
+using Core.Services;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Azure.Functions.Worker.Builder;
 using Microsoft.Azure.Functions.Worker.OpenTelemetry;
@@ -12,6 +15,9 @@ var builder = FunctionsApplication.CreateBuilder(args);
 
 builder.Services.AddHttpClient();
 builder.Services.AddMemoryCache();
+builder.Services.AddSingleton<MySqlDao>();
+builder.Services.AddSingleton<HttpRequestor>();
+builder.Services.AddSingleton<MappingService>();
 
 // Needs APPLICATIONINSIGHTS_CONNECTION_STRING; without it the exporter is a no-op and logs
 // still reach Application Insights through the Functions host relay.
