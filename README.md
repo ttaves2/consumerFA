@@ -11,8 +11,14 @@ If several rows share an `EventName`, the highest `Id` wins. Each POST carries a
 dedupe the redeliveries that follow any failure.
 
 Config (mapping + URL) is cached in memory for 5 minutes, so edits to the table go
-live within 5 minutes without a restart. A non-2xx response throws, which lets
-Service Bus retry and eventually dead-letter the message.
+live within 5 minutes without a restart.
+
+Failures are sorted by whether a replay could succeed. 5xx, 408 and 429 throw, so
+Service Bus redelivers. Every other non-2xx, and any mapping failure, dead-letters
+immediately with the reason attached — replaying those would fail identically.
+Config load failures (SQL down, row missing) leave the message unsettled, so it is
+redelivered once the lock lapses. `host.json` therefore sets
+`autoCompleteMessages: false`; the function settles every message itself.
 
 ## Install
 
@@ -116,8 +122,8 @@ dotnet test
 
 `CoreUnitTest` covers the JSONata mapping step — rename/aggregate, missing fields, and the
 two failure modes (malformed message, malformed mapping config) — plus `DestinationUrl`
-validation. The SQL lookup and the outbound POST are not covered; they need a database
-and a listener.
+validation and the retry/dead-letter split. The SQL lookup and the outbound POST are not
+covered; they need a database and a listener.
 
 ## Layout
 
@@ -129,12 +135,13 @@ and a listener.
 | `Core/Core.csproj` | the function app, and its package versions |
 | `CoreUnitTest/MappingTests.cs` | tests for the mapping step |
 | `CoreUnitTest/DestinationUrlTests.cs` | tests for DestinationUrl validation |
+| `CoreUnitTest/RetryClassificationTests.cs` | tests for which statuses retry vs dead-letter |
 | `consumerFA.slnx` | both projects |
 
 ## Notes
 
 - JSONata is [Jsonata.Net.Native](https://github.com/mikhail-barg/jsonata.net.native). Its `Eval` returns pretty-printed JSON; harmless over HTTP.
 - No retry policy on the outbound POST — Service Bus redelivery covers it. Reach for Polly if the destination flaps.
-- Cache is TTL-only, no invalidation. Restart the host if you need a config change immediately.
+- Cache is TTL-only, no invalidation. Restart the host if you need a config change immediately. A semaphore keeps a cold start from opening one SQL connection per concurrent message.
+- Worker logs reach Application Insights by being relayed through the Functions host, which is the default and needs no package. Set `APPLICATIONINSIGHTS_CONNECTION_STRING` on the function app. For direct worker telemetry (dependency tracking on the SQL and HTTP calls) add the OpenTelemetry packages and exporter.
 - `DestinationUrl` must be an absolute `http`/`https` URL; anything else fails the config load with an error naming the row. The scheme is all that's checked, so keep write access to `InboundMappingConfig` restricted — a valid URL can still point somewhere internal.
-- A 4xx from the destination is retried like a 5xx, so a permanently bad payload burns the full delivery count before dead-lettering.

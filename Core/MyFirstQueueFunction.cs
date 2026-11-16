@@ -1,3 +1,4 @@
+using System.Net;
 using System.Text;
 using Azure.Messaging.ServiceBus;
 using Jsonata.Net.Native;
@@ -18,19 +19,36 @@ public class MyFirstQueueFunction(
     // ponytail: TTL, not invalidation. Config edits go live within 5 min; shorten if that's too slow.
     private static readonly TimeSpan ConfigTtl = TimeSpan.FromMinutes(5);
 
+    // One loader at a time per instance, so a cold start doesn't open maxConcurrentCalls connections.
+    private static readonly SemaphoreSlim ConfigLock = new(1, 1);
+
+    // host.json sets autoCompleteMessages: false, so every path below must settle the message.
     [Function(nameof(MyFirstQueueFunction))]
     public async Task Run(
         [ServiceBusTrigger(QueueName, Connection = "ServiceBusConnection")] ServiceBusReceivedMessage message,
+        ServiceBusMessageActions messageActions,
         CancellationToken cancellationToken)
     {
-        var (query, destinationUrl) = await cache.GetOrCreateAsync(QueueName, async entry =>
-        {
-            entry.AbsoluteExpirationRelativeToNow = ConfigTtl;
-            logger.LogInformation("Loading mapping config for {EventName}", QueueName);
-            return await LoadConfigAsync(QueueName, cancellationToken);
-        })!;
+        // Config failures are transient (SQL down, row not deployed yet): throw, leaving the message
+        // unsettled so it is redelivered once the lock lapses.
+        var (query, destinationUrl) = await GetConfigAsync(cancellationToken);
 
-        var mapped = Map(query, message.Body.ToString());
+        string mapped;
+        try
+        {
+            mapped = Map(query, message.Body.ToString());
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // The body or the mapping is wrong; replaying it will fail identically.
+            logger.LogError(ex, "Mapping failed for {MessageId}", message.MessageId);
+            await messageActions.DeadLetterMessageAsync(
+                message,
+                deadLetterReason: "MappingFailed",
+                deadLetterErrorDescription: Truncate(ex.Message),
+                cancellationToken: cancellationToken);
+            return;
+        }
 
         using var request = new HttpRequestMessage(HttpMethod.Post, destinationUrl)
         {
@@ -43,8 +61,34 @@ public class MyFirstQueueFunction(
 
         logger.LogInformation(
             "Posted {MessageId} to {Url}: {Status}", message.MessageId, destinationUrl, (int)response.StatusCode);
-        response.EnsureSuccessStatusCode(); // non-2xx -> throw -> Service Bus retry/DLQ
+
+        if (response.IsSuccessStatusCode)
+        {
+            await messageActions.CompleteMessageAsync(message, cancellationToken);
+            return;
+        }
+
+        if (IsRetryable(response.StatusCode))
+            throw new HttpRequestException($"Destination returned {(int)response.StatusCode}, will retry.");
+
+        var body = Truncate(await response.Content.ReadAsStringAsync(cancellationToken));
+        logger.LogError(
+            "Dead-lettering {MessageId}: destination returned {Status}. {Body}",
+            message.MessageId, (int)response.StatusCode, body);
+        await messageActions.DeadLetterMessageAsync(
+            message,
+            deadLetterReason: $"Destination returned {(int)response.StatusCode}",
+            deadLetterErrorDescription: body,
+            cancellationToken: cancellationToken);
     }
+
+    /// <summary>
+    /// True when replaying the same request could plausibly succeed. 408 and 429 are 4xx but
+    /// explicitly mean "try again"; every other 4xx is the destination rejecting this payload.
+    /// </summary>
+    public static bool IsRetryable(HttpStatusCode status) =>
+        (int)status >= 500
+        || status is HttpStatusCode.RequestTimeout or HttpStatusCode.TooManyRequests;
 
     /// <summary>Applies a compiled JSONata mapping to a message body.</summary>
     public static string Map(JsonataQuery query, string message) => query.Eval(message);
@@ -58,6 +102,29 @@ public class MyFirstQueueFunction(
             ? uri
             : throw new InvalidOperationException(
                 $"InboundMappingConfig.DestinationUrl for EventName '{eventName}' is not an absolute http(s) URL: '{url}'.");
+
+    // Service Bus caps dead-letter reason/description at 4096 chars and rejects the settlement above it.
+    private static string Truncate(string value) => value.Length <= 1000 ? value : value[..1000];
+
+    private async Task<(JsonataQuery Query, Uri DestinationUrl)> GetConfigAsync(CancellationToken cancellationToken)
+    {
+        if (cache.TryGetValue(QueueName, out (JsonataQuery, Uri) config)) return config;
+
+        await ConfigLock.WaitAsync(cancellationToken);
+        try
+        {
+            if (cache.TryGetValue(QueueName, out config)) return config;
+
+            logger.LogInformation("Loading mapping config for {EventName}", QueueName);
+            config = await LoadConfigAsync(QueueName, cancellationToken);
+            cache.Set(QueueName, config, ConfigTtl);
+            return config;
+        }
+        finally
+        {
+            ConfigLock.Release();
+        }
+    }
 
     private static async Task<(JsonataQuery Query, Uri DestinationUrl)> LoadConfigAsync(
         string eventName, CancellationToken cancellationToken)
