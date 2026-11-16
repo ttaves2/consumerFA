@@ -226,12 +226,23 @@ That is the only way to read a payload that failed, since the dead-letter queue 
 reachable without Service Bus access. Bodies at or under the limit are logged inline and never
 touch storage.
 
-The container is `message-bodies` on the Function App's own storage account
-(`AzureWebJobsStorage`), so there is no second connection string to configure - but a
-deployment using an identity-based connection sets `AzureWebJobsStorage__accountName` instead
-and archiving silently turns off. Blobs are laid out as `yyyy/MM/dd/<MessageId>`, so a
-lifecycle rule can expire them by prefix; nothing expires them today. A redelivery overwrites
-its own blob rather than adding a copy.
+The container is `message-bodies` on the Function App's own storage account, so there is no
+second connection string to configure. Whichever form `AzureWebJobsStorage` takes is used:
+
+| Setting | Auth |
+| --- | --- |
+| `AzureWebJobsStorage` | the connection string, as local Azurite runs use |
+| `AzureWebJobsStorage__blobServiceUri` | the app's managed identity |
+| `AzureWebJobsStorage__accountName` | the app's managed identity, host assumed to be `.blob.core.windows.net` |
+
+A connection string wins if set, then `__blobServiceUri`, then `__accountName`. Prefer
+`__blobServiceUri` outside the public cloud, since deriving the host from the account name
+hardcodes that cloud's suffix. **The identity needs Storage Blob Data Contributor** - the
+archive path creates the container on first use, which Reader cannot do. With none of the
+three set, archiving is off and bodies are logged truncated as before.
+
+Blobs are laid out as `yyyy/MM/dd/<MessageId>`, so a lifecycle rule can expire them by prefix;
+nothing expires them today. A redelivery overwrites its own blob rather than adding a copy.
 
 Archiving never costs a message: if storage is unreachable the line is logged with the
 truncated body alone and a warning beside it, which `BodyArchiveTests` covers.

@@ -5,6 +5,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Xml;
 using Azure.Messaging.ServiceBus;
+using Azure.Identity;
 using Azure.Storage.Blobs;
 using Newtonsoft.Json;
 using Jsonata.Net.Native;
@@ -207,16 +208,38 @@ public class MyFirstQueueFunction(
 
     /// <summary>
     /// The container large bodies are archived to, built from the Function App's own storage
-    /// account so there is no second connection string to configure. Null when that setting is
-    /// absent, which disables archiving rather than failing the message.
+    /// account so there is no second connection string to configure. Null when none of the
+    /// settings are present, which disables archiving rather than failing the message.
     /// </summary>
-    // ponytail: reads the connection-string form of AzureWebJobsStorage. A deployment using an
-    // identity-based connection sets AzureWebJobsStorage__accountName instead, and archiving
-    // silently turns off; pass a DefaultAzureCredential here if you move to one.
-    private static readonly Lazy<BlobContainerClient?> Archive = new(() =>
-        Environment.GetEnvironmentVariable("AzureWebJobsStorage") is { Length: > 0 } connection
-            ? new BlobContainerClient(connection, ArchiveContainer)
-            : null);
+    private static readonly Lazy<BlobContainerClient?> Archive = new(() => ArchiveClient(
+        Environment.GetEnvironmentVariable("AzureWebJobsStorage"),
+        Environment.GetEnvironmentVariable("AzureWebJobsStorage__blobServiceUri"),
+        Environment.GetEnvironmentVariable("AzureWebJobsStorage__accountName")));
+
+    /// <summary>
+    /// Resolves the archive container from however AzureWebJobsStorage is configured: a
+    /// connection string (local Azurite, and older deployments), or the identity-based form,
+    /// which sets <c>__blobServiceUri</c> or <c>__accountName</c> instead and is authenticated
+    /// with the app's managed identity. Returns null when none of them is set.
+    /// </summary>
+    public static BlobContainerClient? ArchiveClient(
+        string? connection, string? blobServiceUri, string? accountName)
+    {
+        if (connection is { Length: > 0 }) return new BlobContainerClient(connection, ArchiveContainer);
+
+        // blobServiceUri is preferred over accountName: deriving the host from the account name
+        // hardcodes the public cloud's suffix, which is wrong in Gov and China.
+        var serviceUri = blobServiceUri is { Length: > 0 } uri ? uri
+            : accountName is { Length: > 0 } account ? $"https://{account}.blob.core.windows.net"
+            : null;
+
+        // The identity needs Storage Blob Data Contributor, not just Reader: the archive path
+        // creates the container on first use as well as writing to it.
+        return serviceUri is null
+            ? null
+            : new BlobContainerClient(
+                new Uri($"{serviceUri.TrimEnd('/')}/{ArchiveContainer}"), new DefaultAzureCredential());
+    }
 
     /// <summary>
     /// Returns the body as it should be logged. A body short enough to log whole is returned

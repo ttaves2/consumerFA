@@ -45,4 +45,39 @@ public class BodyArchiveTests
         Assert.EndsWith("...[truncated]", result);
         Assert.DoesNotContain("full body", result);
     }
+
+    [Fact]
+    public void AConnectionStringWins()
+    {
+        var client = MyFirstQueueFunction.ArchiveClient(
+            "DefaultEndpointsProtocol=http;AccountName=dev;AccountKey=Zm9v;BlobEndpoint=http://127.0.0.1:1/dev;",
+            blobServiceUri: "https://ignored.blob.core.windows.net",
+            accountName: "ignored");
+
+        Assert.Equal("dev", client!.AccountName);
+    }
+
+    [Fact]
+    public void AnAccountNameAloneIsEnough()
+    {
+        // The deployed form: AzureWebJobsStorage__accountName with no connection string anywhere.
+        var client = MyFirstQueueFunction.ArchiveClient(null, null, accountName: "prodstorage");
+
+        Assert.Equal(
+            "https://prodstorage.blob.core.windows.net/message-bodies", client!.Uri.ToString());
+    }
+
+    [Fact]
+    public void AServiceUriBeatsAnAccountName() =>
+        // Deriving the host from the account name hardcodes the public cloud's suffix.
+        Assert.Equal(
+            "https://prodstorage.blob.core.chinacloudapi.cn/message-bodies",
+            MyFirstQueueFunction.ArchiveClient(
+                null,
+                "https://prodstorage.blob.core.chinacloudapi.cn/",
+                "prodstorage")!.Uri.ToString());
+
+    [Fact]
+    public void NoStorageSettingAtAllDisablesArchiving() =>
+        Assert.Null(MyFirstQueueFunction.ArchiveClient(null, null, null));
 }
