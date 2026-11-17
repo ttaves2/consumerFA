@@ -75,7 +75,7 @@ Create `local.settings.json` (git-ignored — copy this and fill in your own val
 ```sql
 CREATE TABLE InboundMappingConfig (
     Id                   int IDENTITY(1,1) NOT NULL PRIMARY KEY,
-    EventName            nvarchar(260)  NOT NULL UNIQUE,
+    EventName            nvarchar(260)  NOT NULL,
     MappingConfig        nvarchar(max)  NOT NULL,
     LastUpdatedBy        nvarchar(25)   NULL,
     LastUpdatedTimestamp datetime2(3)   NULL,
@@ -91,6 +91,10 @@ VALUES (
     N'https://webhook.site/<your-id>'
 );
 ```
+
+`EventName` is not unique. When an event has several rows, the one with the highest `Id` is
+used, so inserting a new row for an event replaces its config within the 5-minute cache window,
+without deleting the old one.
 
 Use [webhook.site](https://webhook.site) as the destination while developing — it gives you
 a throwaway URL and shows the mapped payload it receives.
